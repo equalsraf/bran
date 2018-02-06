@@ -16,7 +16,7 @@ use clap::{App, AppSettings, Arg, SubCommand, ArgMatches};
 use std::fmt::Debug;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::process::exit;
 use std::str::FromStr;
 use std::process;
@@ -124,13 +124,13 @@ fn cmd_start_chrome(args: &ArgMatches) {
     // setup all the parameters we want, basically a large json blob,
     // see https://sites.google.com/a/chromium.org/chromedriver/capabilities
     let mut params = NewSessionCmd::default();
-    params.always_match("goog:chromeOptions", Some(json!({
+    params.always_match("goog:chromeOptions", json!({
         "w3c": true, // This must be true for webdriver to work
         "args": [format!("--user-data-dir={}", path)],
         // look inside you profile in the Preferences file for examples
         "prefs": prefs,
         "extensions": &ext,
-    })));
+    }));
 
     let mut session = driver.session(&params)
         .unwrap_or_exitmsg(-1, "Unable to create browser session");
@@ -195,6 +195,26 @@ fn foreach_element<F, T>(session: &DriverSession, args: &ArgMatches, f: &F) -> R
     Ok(())
 }
 
+/// Common options for handling JSON data, see `print_json_value()`
+fn option_json_filters<'a, 'b>() -> [Arg<'a, 'b>; 1] {
+    [
+        Arg::with_name("FILTER-STR")
+            .long("filter-str")
+            .help("Print string values, ignore other types"),
+    ]
+}
+
+fn print_json_value(val: &JsonValue, args: &ArgMatches) {
+    if args.is_present("FILTER-STR") {
+        if let JsonValue::String(ref val) = *val {
+            println!("{}", val);
+        }
+    } else if JsonValue::Null != *val {
+        println!("{}", val);
+    }
+}
+
+
 fn main() {
     let matches = App::new("ff")
         .about("browsers from your shell")
@@ -236,51 +256,24 @@ fn main() {
                     .about("Refresh page"))
         .subcommand(SubCommand::with_name("source")
                     .about("Print page source"))
-        .subcommand(SubCommand::with_name("attr")
-                    .arg(Arg::with_name("SELECTOR")
-                         .required(true))
-                    .arg(Arg::with_name("ATTRNAME")
-                         .required(true))
-                    .about("Print element attribute"))
-//        .subcommand(SubCommand::with_name("exec")
-//                    .arg(option_port())
-//                    .arg(Arg::with_name("SCRIPT")
-//                         .required(true)
-//                         .help("Javascript code"))
-//                    .arg(Arg::with_name("ASYNC")
-//                         .takes_value(false)
-//                         .long("async")
-//                         .help("Run asynchronous script"))
-//                    .arg(Arg::with_name("SANDBOX")
-//                         .takes_value(true)
-//                         .long("sandbox")
-//                         .required(false)
-//                         .help("Sandbox name"))
-//                    .arg(Arg::with_name("TIMEOUT")
-//                         .takes_value(true)
-//                         .long("timeout")
-//                         .required(false)
-//                         .help("Timeout script execution after TIMEOUT milliseconds"))
-//                    .arg(Arg::with_name("ARG")
-//                         .multiple(true)
-//                         .required(false)
-//                         .help("Script arguments[]"))
-//                    .args(&option_json_filters())
-//                    .about("Executes script in all frames, print its return value"))
+        .subcommand(SubCommand::with_name("exec")
+                    .arg(Arg::with_name("SCRIPT")
+                         .required(true)
+                         .help("Javascript code"))
+                    .arg(Arg::with_name("ARG")
+                         .multiple(true)
+                         .required(false)
+                         .help("Script arguments[]"))
+                    .args(&option_json_filters())
+                    .about("Executes script in all frames, print its return value"))
         .subcommand(SubCommand::with_name("property")
                     .arg(Arg::with_name("SELECTOR")
                          .required(true))
                     .arg(Arg::with_name("NAME")
                          .required(true))
-//                    .args(&option_json_filters())
+                    .args(&option_json_filters())
                     .about("Print element property")
                     .alias("prop"))
-        // FIXME this is the same as 'prop SEL text'
-//        .subcommand(SubCommand::with_name("text")
-//                    .arg(option_port())
-//                    .arg(Arg::with_name("SELECTOR")
-//                         .required(true))
-//                    .about("Print element text"))
 //        .subcommand(SubCommand::with_name("instances")
 //                    .about("List running ff instances"))
         .subcommand(SubCommand::with_name("title")
@@ -305,24 +298,41 @@ fn main() {
             .expect("Unable to initialize stderr output");
 
     match matches.subcommand() {
-        ("attr", Some(ref args)) => {
-            let mut session = get_session();
-            let attrname = args.value_of("ATTRNAME").unwrap();
-            session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
-            foreach_frame(&session, args, &|session, args| {
-                foreach_element(&session, args, &|elem| {
-                    let text = elem.attribute(attrname)?;
-                    if !text.is_empty() {
-                        println!("{}", text);
-                    }
-                    Ok(())
-                })
-            }).unwrap_or_exit(-1);
-            session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
-        }
         ("back", _) => {
             get_session().back()
                 .unwrap_or_exitmsg(-1, "Error calling driver");
+        }
+        ("exec", Some(ref args)) => {
+            let mut session = get_session();
+            let mut js = args.value_of("SCRIPT").unwrap().to_owned();
+            if js == "-" {
+                js.clear();
+                io::stdin().read_to_string(&mut js).unwrap_or_exitmsg(-1, "Error reading script from stdin");
+            }
+
+            let mut script_args = Vec::new();
+            if let Some(l) = args.values_of("ARG") {
+                for arg in l {
+                    let arg = JsonValue::from_str(arg).unwrap_or_exitmsg(-1, "Script argument is invalid JSON");
+                    script_args.push(arg);
+                }
+            }
+
+            session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
+            foreach_frame(&mut session, args, &|session, args| {
+                // FIXME add support for async scripts
+                let res = session.execute(ExecuteCmd {
+                    script: js.clone(),
+                    args: script_args.clone(),
+                });
+
+                match res {
+                    Ok(val) => print_json_value(&val, args),
+                    Err(err) => return Err(err),
+                }
+                Ok(())
+            }).unwrap_or_exit(-1);
+            session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
         }
         ("forward", _) => {
             get_session().forward()
@@ -342,14 +352,13 @@ fn main() {
                 foreach_element(session, args, &|elem| {
                     // chrome does not implement property, so we emulate it
                     // using js
-                    let prop = session.execute(ExecuteCmd {
+                    let val = session.execute(ExecuteCmd {
                         script: format!("return arguments[0].{};", propname),
                         // the browser will convert the json reference to a js reference
                         args: vec![elem.reference().unwrap()],
                     }).expect("Error executing script");
 
-                    // FIXME convert json to string
-                    println!("{:?}", prop);
+                    print_json_value(&val, args);
                     Ok(())
                 })
             }).unwrap_or_exit(-1);
@@ -381,7 +390,7 @@ fn main() {
                 .expect("Invalid WINDOW index");
             let mut handles = session.get_window_handles()
                 .unwrap_or_exitmsg(-1, "Unable to get window list");
-            let handle = handles.drain((..))
+            let handle = handles.drain(..)
                 .nth(idx)
                 .unwrap_or_exitmsg(-1, "Index is invalid");
             session.switch_window(&handle)
