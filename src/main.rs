@@ -126,7 +126,9 @@ fn cmd_start_chrome(args: &ArgMatches) {
     let mut params = NewSessionCmd::default();
     params.always_match("goog:chromeOptions", json!({
         "w3c": true, // This must be true for webdriver to work
-        "args": [format!("--user-data-dir={}", path)],
+        // FIXME the user-data-dir seems to play havoc with the use of the GPU, I have not been
+        // able to figure it out so its hardcoded here TODO allow the caller to override arguments
+        "args": ["--disable-gpu", format!("--user-data-dir={}", path)],
         // look inside you profile in the Preferences file for examples
         "prefs": prefs,
         "extensions": &ext,
