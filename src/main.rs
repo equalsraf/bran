@@ -216,6 +216,22 @@ fn print_json_value(val: &JsonValue, args: &ArgMatches) {
     }
 }
 
+/// chrome does not implement property, so we emulate it using js
+fn get_property(session: &DriverSession, propname: &str, elem: &Element) -> Result<JsonValue, webdriver_client::Error> {
+    session.execute(ExecuteCmd {
+        script: format!("return arguments[0].{};", propname),
+        // the browser will convert the json reference to a js reference
+        args: vec![elem.reference().unwrap()],
+    })
+}
+
+fn exec_script(session: &DriverSession, script: String, arguments: Vec<JsonValue>) -> Result<JsonValue, webdriver_client::Error> {
+    session.execute(ExecuteCmd {
+        script,
+        args: arguments,
+    })
+}
+
 
 fn main() {
     let matches = App::new("ff")
@@ -259,6 +275,8 @@ fn main() {
         .subcommand(SubCommand::with_name("source")
                     .about("Print page source"))
         .subcommand(SubCommand::with_name("exec")
+                    .arg(Arg::with_name("all-frames")
+                         .short("A"))
                     .arg(Arg::with_name("SCRIPT")
                          .required(true)
                          .help("Javascript code"))
@@ -267,8 +285,10 @@ fn main() {
                          .required(false)
                          .help("Script arguments[]"))
                     .args(&option_json_filters())
-                    .about("Executes script in all frames, print its return value"))
+                    .about("Executes script, print its return value"))
         .subcommand(SubCommand::with_name("property")
+                    .arg(Arg::with_name("all-frames")
+                         .short("A"))
                     .arg(Arg::with_name("SELECTOR")
                          .required(true))
                     .arg(Arg::with_name("NAME")
@@ -321,19 +341,23 @@ fn main() {
             }
 
             session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
-            foreach_frame(&mut session, args, &|session, args| {
-                // FIXME add support for async scripts
-                let res = session.execute(ExecuteCmd {
-                    script: js.clone(),
-                    args: script_args.clone(),
-                });
 
-                match res {
-                    Ok(val) => print_json_value(&val, args),
-                    Err(err) => return Err(err),
-                }
-                Ok(())
-            }).unwrap_or_exit(-1);
+            if args.is_present("all-frames") {
+                foreach_frame(&mut session, args, &|session, args| {
+                    match exec_script(session, js.clone(), script_args.clone()) {
+                        Ok(val) => {
+                            print_json_value(&val, args);
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }
+                }).unwrap_or_exit(-1);
+            } else {
+                let res =  exec_script(&session, js.clone(), script_args.clone())
+                    .unwrap_or_exit(-1);
+                print_json_value(&res, args);
+            }
+
             session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
         }
         ("forward", _) => {
@@ -350,20 +374,25 @@ fn main() {
             let session = get_session();
             let propname = args.value_of("NAME").unwrap();
             session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
-            foreach_frame(&session, args, &|session, args| {
-                foreach_element(session, args, &|elem| {
-                    // chrome does not implement property, so we emulate it
-                    // using js
-                    let val = session.execute(ExecuteCmd {
-                        script: format!("return arguments[0].{};", propname),
-                        // the browser will convert the json reference to a js reference
-                        args: vec![elem.reference().unwrap()],
-                    }).expect("Error executing script");
 
+            if args.is_present("all-frames") {
+                foreach_frame(&session, args, &|session, args| {
+                    foreach_element(session, args, &|elem| {
+                        let val = get_property(session, propname, elem)
+                            .expect("Error executing script");
+                        print_json_value(&val, args);
+                        Ok(())
+                    })
+                }).unwrap_or_exit(-1);
+            } else {
+                foreach_element(&session, args, &|elem| {
+                    let val = get_property(&session, propname, elem)
+                        .expect("Error executing script");
                     print_json_value(&val, args);
                     Ok(())
-                })
-            }).unwrap_or_exit(-1);
+                }).unwrap_or_exit(-1);
+            }
+
             session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
         }
         ("refresh", _) => {
