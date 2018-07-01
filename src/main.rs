@@ -2,8 +2,8 @@
 
 extern crate webdriver_client;
 use webdriver_client::chrome::ChromeDriver;
-use webdriver_client::messages::{NewSessionCmd, LocationStrategy, ExecuteCmd};
-use webdriver_client::{Driver, JsonValue, DriverSession, Element};
+use webdriver_client::messages::NewSessionCmd;
+use webdriver_client::{Driver, JsonValue};
 
 #[macro_use]
 extern crate serde_json;
@@ -13,72 +13,16 @@ extern crate stderrlog;
 extern crate clap;
 use clap::{App, AppSettings, Arg, SubCommand, ArgMatches};
 
-use std::fmt::Debug;
+extern crate bran;
+use bran::{get_session, ExitOnError, get_property, foreach_element, foreach_frame, exec_script};
+
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
-use std::process::exit;
+use std::io::{self, Read};
 use std::str::FromStr;
 use std::process;
 use std::thread;
 use std::time::Duration;
-
-trait ExitOnError<T>: Sized {
-    fn exit(code: i32, msg: Option<&str>) -> ! {
-        if let Some(msg) = msg {
-            let _ = writeln!(&mut std::io::stderr(), "{}", msg);
-        }
-        exit(code);
-    }
-
-    fn unwrap_or_exit(self, code: i32) -> T;
-    fn unwrap_or_exitmsg(self, code: i32, msg: &str) -> T;
-}
-
-impl<T, E: Debug> ExitOnError<T> for std::result::Result<T, E> {
-    fn unwrap_or_exit(self, code: i32) -> T {
-        match self {
-            Ok(res) => res,
-            Err(err) => {
-                Self::exit(code, Some(&format!("{:?}", err)));
-            }
-        }
-    }
-
-    fn unwrap_or_exitmsg(self, code: i32, msg: &str) -> T {
-        match self {
-            Ok(res) => res,
-            Err(err) => {
-                Self::exit(code, Some(&format!("{}: {:?}", msg, err)));
-            }
-        }
-    }
-}
-impl<T> ExitOnError<T> for Option<T> {
-    fn unwrap_or_exit(self, code: i32) -> T {
-        match self {
-            Some(res) => res,
-            None => Self::exit(code, None),
-        }
-    }
-    fn unwrap_or_exitmsg(self, code: i32, msg: &str) -> T {
-        match self {
-            Some(res) => res,
-            None => Self::exit(code, Some(msg)),
-        }
-    }
-}
-
-fn get_session() -> DriverSession{
-    let url = env::var("BRAN_URL")
-        .unwrap_or_exitmsg(-1, "$BRAN_URL is not set");
-    let session_id = env::var("BRAN_SESSION")
-        .unwrap_or_exitmsg(-1, "$BRAN_SESSION is not set");
-    let mut session = DriverSession::attach(&url, &session_id)
-        .unwrap_or_exitmsg(-1, "Unable to attach to session");
-    session.drop_session(false);
-    session
-}
 
 /// Start chromedriver.
 ///
@@ -186,31 +130,6 @@ fn cmd_windows() -> Result<(), webdriver_client::Error> {
     Ok(())
 }
 
-const FRAME_SELECTOR: &'static str = "iframe, frame";
-
-/// Iterate over all frames under the current frame
-fn foreach_frame<F>(session: &DriverSession, args: &ArgMatches, f: &F) -> Result<(), webdriver_client::Error>
-        where F: Fn(&DriverSession, &ArgMatches) -> Result<(), webdriver_client::Error> {
-    f(session, args)?;
-    let elements = session.find_elements(FRAME_SELECTOR, LocationStrategy::Css)?;
-    for frame in &elements {
-        session.switch_to_frame(frame.reference()?)?;
-        foreach_frame(session, args, f)?;
-        session.switch_to_parent_frame()?;
-    }
-    Ok(())
-}
-
-/// Iterate over elements based on argument "SELECTOR"
-fn foreach_element<F, T>(session: &DriverSession, args: &ArgMatches, f: &F) -> Result<(), webdriver_client::Error>
-        where F: Fn(&Element) -> Result<T, webdriver_client::Error> {
-    let selector =  args.value_of("SELECTOR").unwrap();
-    for elem in session.find_elements(selector, LocationStrategy::Css)? {
-        f(&elem)?;
-    }
-    Ok(())
-}
-
 /// Common options for handling JSON data, see `print_json_value()`
 fn option_json_filters<'a, 'b>() -> [Arg<'a, 'b>; 1] {
     [
@@ -229,23 +148,6 @@ fn print_json_value(val: &JsonValue, args: &ArgMatches) {
         println!("{}", val);
     }
 }
-
-/// chrome does not implement property, so we emulate it using js
-fn get_property(session: &DriverSession, propname: &str, elem: &Element) -> Result<JsonValue, webdriver_client::Error> {
-    session.execute(ExecuteCmd {
-        script: format!("return arguments[0].{};", propname),
-        // the browser will convert the json reference to a js reference
-        args: vec![elem.reference().unwrap()],
-    })
-}
-
-fn exec_script(session: &DriverSession, script: String, arguments: Vec<JsonValue>) -> Result<JsonValue, webdriver_client::Error> {
-    session.execute(ExecuteCmd {
-        script,
-        args: arguments,
-    })
-}
-
 
 fn main() {
     let matches = App::new("ff")
@@ -357,8 +259,8 @@ fn main() {
             session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
 
             if args.is_present("all-frames") {
-                foreach_frame(&mut session, args, &|session, args| {
-                    match exec_script(session, js.clone(), script_args.clone()) {
+                foreach_frame(&mut session, &|session| {
+                    match exec_script(session, &js, script_args.clone()) {
                         Ok(val) => {
                             print_json_value(&val, args);
                             Ok(())
@@ -367,7 +269,7 @@ fn main() {
                     }
                 }).unwrap_or_exit(-1);
             } else {
-                let res =  exec_script(&session, js.clone(), script_args.clone())
+                let res =  exec_script(&session, &js, script_args.clone())
                     .unwrap_or_exit(-1);
                 print_json_value(&res, args);
             }
@@ -388,10 +290,11 @@ fn main() {
             let session = get_session();
             let propname = args.value_of("NAME").unwrap();
             session.switch_to_frame(JsonValue::Null).unwrap_or_exit(-1);
+            let selector =  args.value_of("SELECTOR").unwrap();
 
             if args.is_present("all-frames") {
-                foreach_frame(&session, args, &|session, args| {
-                    foreach_element(session, args, &|elem| {
+                foreach_frame(&session, &|session| {
+                    foreach_element(session, selector, &|elem| {
                         let val = get_property(session, propname, elem)
                             .expect("Error executing script");
                         print_json_value(&val, args);
@@ -399,7 +302,7 @@ fn main() {
                     })
                 }).unwrap_or_exit(-1);
             } else {
-                foreach_element(&session, args, &|elem| {
+                foreach_element(&session, selector, &|elem| {
                     let val = get_property(&session, propname, elem)
                         .expect("Error executing script");
                     print_json_value(&val, args);
