@@ -20,6 +20,8 @@ use std::io::{self, Read, Write};
 use std::process::exit;
 use std::str::FromStr;
 use std::process;
+use std::thread;
+use std::time::Duration;
 
 trait ExitOnError<T>: Sized {
     fn exit(code: i32, msg: Option<&str>) -> ! {
@@ -78,18 +80,24 @@ fn get_session() -> DriverSession{
     session
 }
 
+/// Start chromedriver.
+///
+/// The function blocks waiting for the browser to be finished
+///
+/// - if -S is passed by the user the function calls the $SHELL and
+///   waits for the shell process to finish.
+/// - otherwise the function starts the chrome driver and blocks
+///   until its session is no longer available.
+///
+/// When this function ends the session is dropped and the profile
+/// temporary folder is removed.
 fn cmd_start_chrome(args: &ArgMatches) {
-    let mut tmp = mktemp::Temp::new_dir()
+    let tmp = mktemp::Temp::new_dir()
         .unwrap_or_exitmsg(-1, "Unable to create tmp folder");
-
-    let spawn_shell = args.is_present("spawn-shell");
-    if !spawn_shell {
-        tmp.release();
-    }
 
     let driver = ChromeDriver::build()
         // Dont kill the child driver on exit
-        .kill_on_drop(spawn_shell)
+        .kill_on_drop(true)
         .spawn()
         .unwrap_or_exitmsg(-1, "Unable to start driver");
 
@@ -134,16 +142,14 @@ fn cmd_start_chrome(args: &ArgMatches) {
         "extensions": &ext,
     }));
 
-    let mut session = driver.session(&params)
+    let session = driver.session(&params)
         .unwrap_or_exitmsg(-1, "Unable to create browser session");
-    // FIXME: chromedriver session drop seems to hang
-    session.drop_session(spawn_shell);
 
     println!("export BRAN_URL={}", url);
     println!("export BRAN_SESSION={}", session.session_id());
     println!("export BRAN_PROFILE={}", path);
 
-    if spawn_shell {
+    if args.is_present("spawn-shell") {
         env::set_var("BRAN_URL", &url);
         env::set_var("BRAN_SESSION", session.session_id());
         env::set_var("BRAN_PROFILE", tmp.as_ref());
@@ -153,9 +159,17 @@ fn cmd_start_chrome(args: &ArgMatches) {
         let mut child = process::Command::new(shell)
             .spawn()
             .unwrap_or_exitmsg(-1, "Unable to spawn user shell");
-
         let _ = child.wait();
         println!("SHELL has finished, dropping browser");
+    } else {
+        loop {
+            // Currently there is no way to wait for the driver to finish. This would
+            // have to be implemented upstream in the webdriver client.
+            thread::sleep(Duration::new(15, 0));
+            if session.get_current_url().is_err() {
+                break;
+            }
+        }
     }
 }
 
@@ -399,7 +413,20 @@ fn main() {
             get_session().refresh()
                 .unwrap_or_exitmsg(-1, "Error calling driver");
         }
-        ("start", Some(ref args)) => cmd_start_chrome(args),
+        ("start", Some(ref args)) => {
+            // The environment variable $BRAN_NOFORK is used to signal the current
+            // bran process should block instead of calling a child process.
+            if args.is_present("spawn-shell") || env::var_os("BRAN_NOFORK").is_some() {
+                cmd_start_chrome(args);
+            } else {
+                let mut child_args: Vec<_> = env::args().collect();
+                process::Command::new(&child_args[0])
+                    .args(&child_args[1..])
+                    .env("BRAN_NOFORK", "1")
+                    .spawn()
+                    .unwrap_or_exitmsg(-1, "Unable to spawn child process");
+            }
+        }
         ("title", _) => {
             let session = get_session();
             let url = session.get_title()
