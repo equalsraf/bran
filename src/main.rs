@@ -3,7 +3,7 @@
 extern crate webdriver_client;
 use webdriver_client::chrome::ChromeDriver;
 use webdriver_client::messages::NewSessionCmd;
-use webdriver_client::{Driver, JsonValue};
+use webdriver_client::{Driver, JsonValue, Error};
 
 #[macro_use]
 extern crate serde_json;
@@ -106,12 +106,17 @@ fn cmd_start_chrome(args: &ArgMatches) {
         let _ = child.wait();
         println!("SHELL has finished, dropping browser");
     } else {
+        let mut count = 0;
         loop {
-            // Currently there is no way to wait for the driver to finish. This would
-            // have to be implemented upstream in the webdriver client.
-            thread::sleep(Duration::new(15, 0));
-            if session.get_current_url().is_err() {
+            if count > 3 {
                 break;
+            }
+            thread::sleep(Duration::new(15, 0));
+            match session.get_current_url() {
+                Err(Error::Io(_)) => {
+                    count += 1;
+                }
+                _ => (),
             }
         }
     }
