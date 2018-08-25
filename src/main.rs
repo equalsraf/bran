@@ -3,7 +3,7 @@
 extern crate webdriver_client;
 use webdriver_client::chrome::ChromeDriver;
 use webdriver_client::messages::NewSessionCmd;
-use webdriver_client::{Driver, JsonValue, Error};
+use webdriver_client::{Driver, JsonValue};
 
 #[macro_use]
 extern crate serde_json;
@@ -111,12 +111,15 @@ fn cmd_start_chrome(args: &ArgMatches) {
             if count > 3 {
                 break;
             }
+
             thread::sleep(Duration::new(15, 0));
-            match session.get_current_url() {
-                Err(Error::Io(_)) => {
+            // see https://bugs.chromium.org/p/chromedriver/issues/detail?id=346
+            // getting the url might fail, but hopefully this is safe to call
+            match session.get_window_handles() {
+                Err(_err) => {
                     count += 1;
                 }
-                _ => (),
+                Ok(_) => (),
             }
         }
     }
